@@ -1,0 +1,15 @@
+{
+  "name": "@oresoftware/ores-sidecar-contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "contract:check": "tjsv check --typespec=./contracts/main.tsp --schema=./contracts/authored.schema.json --instances=./contracts/instances --report=./artifacts/schema-parity.json --quiet"
+  },
+  "devDependencies": {
+    "@oresoftware/typespec-json-schema-validator": "https://github.com/ORESoftware/typespec-json-schema-validator/archive/7241f8e52dcc4518c72f0fdb5152d6cf66c86656.tar.gz"
+  },
+  "engines": {
+    "node": ">=22.9"
+  }
+}

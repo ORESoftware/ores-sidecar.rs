@@ -1,0 +1,39 @@
+[package]
+org = "oresoftware"
+name = "ores-sidecar"
+version = "0.1.0"
+description = "Shared Rust sidecar configuration and runtime-update contracts"
+license = "MIT"
+keywords = ["sidecar", "runtime", "config", "redis", "rust"]
+language = "rust"
+
+[package.repository]
+vcs = "git"
+url = "https://github.com/ORESoftware/ores-sidecar.rs"
+
+[publish]
+include_readme = true
+tag_format = "v{version}"
+smoke_test = "cargo test --all-targets"
+exclude = [
+  ".env",
+  ".env.*",
+  "target/**",
+  "**/target/**",
+  "node_modules/**",
+  "artifacts/**",
+  ".typespec-json-schema-validator/**",
+  "**/*.log",
+  ".DS_Store",
+]
+
+[install]
+dir = ".vendor/.zed"
+
+[targets.rust]
+dir = "."
+adapter = "rust"
+
+[scripts]
+test = "cargo test --all-targets"
+contracts = "npm install --no-audit --no-fund && mkdir -p artifacts && npm run contract:check"

@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ores.sidecar.authored.schema.json",
+  "$defs": {
+    "RuntimeUpdateProvider": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "RuntimeUpdateProvider",
+      "type": "string",
+      "enum": ["ores-redis-lru-cache"]
+    },
+    "RuntimeUpdateRole": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "RuntimeUpdateRole",
+      "type": "string",
+      "enum": ["server"]
+    },
+    "RuntimeUpdates": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "RuntimeUpdates",
+      "type": "object",
+      "properties": {
+        "provider": { "$ref": "RuntimeUpdateProvider" },
+        "lruConfigPath": { "type": "string" },
+        "role": { "$ref": "RuntimeUpdateRole" },
+        "cache": { "type": "string" }
+      },
+      "required": ["provider", "lruConfigPath", "role", "cache"],
+      "unevaluatedProperties": false
+    },
+    "Sidecar": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "Sidecar",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "bindIp": { "type": "string" },
+        "bindPort": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "loopbackOnly": { "type": "boolean" },
+        "runtimeNamespace": { "type": "string" },
+        "runtimeKeys": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": [
+        "name",
+        "enabled",
+        "bindIp",
+        "bindPort",
+        "loopbackOnly",
+        "runtimeNamespace",
+        "runtimeKeys"
+      ],
+      "unevaluatedProperties": false
+    },
+    "SidecarConfig": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SidecarConfig",
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string", "const": "ores.sidecar-config.v1" },
+        "runtimeUpdates": { "$ref": "RuntimeUpdates" },
+        "sidecars": { "type": "array", "items": { "$ref": "Sidecar" } }
+      },
+      "required": ["protocol", "runtimeUpdates", "sidecars"],
+      "unevaluatedProperties": false
+    },
+    "RuntimeValue": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "RuntimeValue",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string" },
+        "value": { "type": "string" }
+      },
+      "required": ["key", "value"],
+      "unevaluatedProperties": false
+    },
+    "RuntimeSnapshotUpdate": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "RuntimeSnapshotUpdate",
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string", "const": "ores.sidecar-runtime.v1" },
+        "sidecar": { "type": "string" },
+        "revision": { "type": "string" },
+        "values": { "type": "array", "items": { "$ref": "RuntimeValue" } }
+      },
+      "required": ["protocol", "sidecar", "revision", "values"],
+      "unevaluatedProperties": false
+    }
+  }
+}
