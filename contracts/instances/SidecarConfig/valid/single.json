@@ -1,0 +1,20 @@
+{
+  "protocol": "ores.sidecar-config.v1",
+  "runtimeUpdates": {
+    "provider": "ores-redis-lru-cache",
+    "lruConfigPath": ".ores-lru.toml",
+    "role": "server",
+    "cache": "runtime-env"
+  },
+  "sidecars": [
+    {
+      "name": "ores-chat",
+      "enabled": true,
+      "bindIp": "127.0.0.1",
+      "bindPort": 7410,
+      "loopbackOnly": true,
+      "runtimeNamespace": "ores-chat",
+      "runtimeKeys": ["PROVIDER_TIMEOUT_MS"]
+    }
+  ]
+}
