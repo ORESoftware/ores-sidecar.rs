@@ -27,6 +27,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.9.0'
-          cache: npm
       - run: npm install --no-audit --no-fund
       - run: mkdir -p artifacts && npm run contract:check
