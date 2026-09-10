@@ -1,0 +1,8 @@
+{
+  "protocol": "ores.sidecar-runtime.v1",
+  "sidecar": "ores-chat",
+  "revision": "42",
+  "values": [
+    { "key": "PROVIDER_TIMEOUT_MS", "value": "2500" }
+  ]
+}
