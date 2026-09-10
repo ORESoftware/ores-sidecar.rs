@@ -1,0 +1,29 @@
+{
+  "protocol": "ores.sidecar-config.v1",
+  "runtimeUpdates": {
+    "provider": "ores-redis-lru-cache",
+    "lruConfigPath": ".ores-lru.toml",
+    "role": "server",
+    "cache": "runtime-env"
+  },
+  "sidecars": [
+    {
+      "name": "api",
+      "enabled": true,
+      "bindIp": "127.0.0.1",
+      "bindPort": 7410,
+      "loopbackOnly": true,
+      "runtimeNamespace": "api",
+      "runtimeKeys": ["REQUEST_TIMEOUT_MS"]
+    },
+    {
+      "name": "worker",
+      "enabled": true,
+      "bindIp": "127.0.0.1",
+      "bindPort": 7420,
+      "loopbackOnly": true,
+      "runtimeNamespace": "worker",
+      "runtimeKeys": ["WORKER_BATCH_SIZE"]
+    }
+  ]
+}
