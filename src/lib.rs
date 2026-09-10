@@ -75,6 +75,10 @@ impl Sidecar {
             .parse()
             .map_err(|_| Error::InvalidConfig("sidecars.bindIp must be an IP address"))
     }
+
+    pub fn bind_address(&self) -> String {
+        format!("{}:{}", self.bind_ip, self.bind_port)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -300,9 +304,7 @@ impl RuntimeState {
                 return Err(Error::RuntimeKeyNotAllowed(entry.key));
             }
             if entry.value.len() > MAX_RUNTIME_VALUE_BYTES {
-                return Err(Error::InvalidRuntimeUpdate(
-                    "runtime value exceeds 64 KiB",
-                ));
+                return Err(Error::InvalidRuntimeUpdate("runtime value exceeds 64 KiB"));
             }
             if next.insert(entry.key.clone(), entry.value).is_some() {
                 return Err(Error::DuplicateRuntimeValue(entry.key));
@@ -323,9 +325,7 @@ impl RuntimeState {
 
 pub fn is_sensitive_runtime_key(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
-    SENSITIVE_KEY_PARTS
-        .iter()
-        .any(|part| upper.contains(part))
+    SENSITIVE_KEY_PARTS.iter().any(|part| upper.contains(part))
 }
 
 pub fn is_runtime_key_allowed(key: &str) -> bool {
@@ -517,7 +517,9 @@ runtimeKeys = ["REQUEST_TIMEOUT_MS"]"#,
         assert_eq!(parsed.resolve_one(Some("worker")).unwrap().bind_port, 7420);
         let all = parsed.resolve_all().unwrap();
         assert_eq!(
-            all.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            all.iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["api", "worker"]
         );
     }
@@ -620,7 +622,11 @@ runtimeKeys = ["PROVIDER_TIMEOUT_MS"]"#,
             }
         );
         assert_eq!(
-            state.snapshot().values.get("PROVIDER_TIMEOUT_MS").map(String::as_str),
+            state
+                .snapshot()
+                .values
+                .get("PROVIDER_TIMEOUT_MS")
+                .map(String::as_str),
             Some("2500")
         );
     }
