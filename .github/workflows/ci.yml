@@ -8,24 +8,78 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: sidecar-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  EXACT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Checkout exact revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ env.EXACT_SHA }}
+          persist-credentials: false
+
+      - name: Assert exact revision
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$EXACT_SHA"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.85.0
           components: rustfmt, clippy
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
+
+      - name: Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Rust lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --locked --all-targets
 
   contracts:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout exact revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          node-version: '22.9.0'
-      - run: npm install --no-audit --no-fund
-      - run: mkdir -p artifacts && npm run contract:check
+          ref: ${{ env.EXACT_SHA }}
+          persist-credentials: false
+
+      - name: Assert exact revision
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$EXACT_SHA"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22.16.0'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install locked contract dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Verify peer-authority contract
+        run: |
+          mkdir -p artifacts
+          npm run contract:check
+          test -s artifacts/schema-parity.json
+
+      - name: Retain TJSV parity receipt
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: sidecar-tjsv-${{ env.EXACT_SHA }}
+          path: artifacts/schema-parity.json
+          if-no-files-found: warn
+          retention-days: 90
