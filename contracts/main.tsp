@@ -52,3 +52,22 @@ model RuntimeSnapshotUpdate {
   revision: string;
   values: RuntimeValue[];
 }
+
+@id("RuntimeEventOperation")
+enum RuntimeEventOperation {
+  upsert: "upsert",
+  delete: "delete",
+  replace: "replace",
+  invalidate: "invalidate",
+  resync: "resync",
+}
+
+@id("RuntimeEventUpdate")
+model RuntimeEventUpdate {
+  protocol: "ores.sidecar-runtime-event.v1";
+  sidecar: string;
+  revision: string;
+  operation: RuntimeEventOperation;
+  values?: RuntimeValue[];
+  keys?: string[];
+}

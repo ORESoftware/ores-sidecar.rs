@@ -86,6 +86,27 @@
       },
       "required": ["protocol", "sidecar", "revision", "values"],
       "unevaluatedProperties": false
+    },
+    "RuntimeEventOperation": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "RuntimeEventOperation",
+      "type": "string",
+      "enum": ["upsert", "delete", "replace", "invalidate", "resync"]
+    },
+    "RuntimeEventUpdate": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "RuntimeEventUpdate",
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string", "const": "ores.sidecar-runtime-event.v1" },
+        "sidecar": { "type": "string" },
+        "revision": { "type": "string" },
+        "operation": { "$ref": "RuntimeEventOperation" },
+        "values": { "type": "array", "items": { "$ref": "RuntimeValue" } },
+        "keys": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["protocol", "sidecar", "revision", "operation"],
+      "unevaluatedProperties": false
     }
   }
 }
