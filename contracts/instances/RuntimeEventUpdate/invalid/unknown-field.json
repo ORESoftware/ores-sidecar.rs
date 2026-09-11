@@ -1,0 +1,7 @@
+{
+  "protocol": "ores.sidecar-runtime-event.v1",
+  "sidecar": "chat",
+  "revision": "2",
+  "operation": "invalidate",
+  "unexpected": true
+}

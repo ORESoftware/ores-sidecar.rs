@@ -1,9 +1,8 @@
-
-Note: canonical lib is in - ores-otel/ores-otel-sidecar.rs - The repo-local control file confirms the same thing even more explicitly: ores-otel/ores-otel-sidecar.rs is the canonical shared library, and product sidecars are supposed to import it rather than copy config/health/runtime.
-
 # ores-sidecar.rs
 
-Shared Rust configuration and runtime-update contracts for ORESoftware sidecars.
+Shared Rust configuration and runtime-update **contract authority** for ORESoftware sidecars.
+
+`ORESoftware/ores-sidecar.rs` owns the reusable `.ores-sidecar.toml`, snapshot, and ordered runtime-event contracts. `ores-otel/ores-otel-sidecar.rs` remains the canonical executable/inherited sidecar runtime implementation; product sidecars should import that runtime instead of copying its health, receiver, or process machinery. Keeping these roles distinct prevents an executable consumer from silently becoming a second editable configuration authority.
 
 ## `.ores-sidecar.toml`
 
@@ -28,13 +27,33 @@ runtimeNamespace = "api"
 runtimeKeys = ["REQUEST_TIMEOUT_MS"]
 ```
 
-Listener settings are immutable process configuration. Runtime updates are a separate full-snapshot overlay: each sidecar explicitly allowlists mutable keys, secret-looking environment keys are rejected, updates target one sidecar identity, and revisions are monotonic. Revision values are decimal strings on the cross-runtime wire so JavaScript and other runtimes do not lose integer precision.
+Listener settings are immutable process configuration. Runtime updates are a separate allowlisted overlay: each sidecar explicitly declares mutable keys, secret-looking environment keys are rejected, updates target one sidecar identity, and revisions are monotonic. Revision values are decimal strings on cross-runtime wires so JavaScript and other runtimes do not lose integer precision.
 
-`runtimeUpdates.lruConfigPath` points to the existing `.ores-lru.toml` authority rather than duplicating Redis URLs, key prefixes, reconnect policy, or pub/sub settings here. The intended adapter is `ores-redis-lru-cache`'s `runtime-env` cache: it reconciles Redis/pubsub state first and then applies an authoritative snapshot through `RuntimeState::apply`.
+`runtimeUpdates.lruConfigPath` points to the existing `.ores-lru.toml` authority rather than duplicating Redis URLs, key prefixes, reconnect policy, or pub/sub settings here. The intended adapter is `ores-redis-lru-cache`'s `runtime-env` cache.
+
+### Full snapshots
+
+Simple consumers can translate a reconciled backend snapshot into `RuntimeSnapshotUpdate` (`ores.sidecar-runtime.v1`) and apply it through `RuntimeState::apply`. Values are validated as one atomic allowlisted map; an older or equal revision cannot regress the existing state.
+
+### Ordered runtime events
+
+Consumers that ingest backend events use `RuntimeEventState` and `RuntimeEventUpdate` (`ores.sidecar-runtime-event.v1`). The event contract supports:
+
+- `upsert` for bounded allowlisted key/value patches;
+- `delete` for bounded allowlisted key removals;
+- `replace` for atomic replacement of the full runtime overlay;
+- `invalidate` for clearing the overlay; and
+- `resync` as an explicit reconciliation fence.
+
+Events must advance exactly one revision at a time. A valid revision gap or `resync` makes the event state sticky-stale; later incremental events cannot repair it. An authoritative full snapshot at the same or a newer revision is required to clear the stale fence. Malformed events, secret-like keys, undeclared keys, duplicate keys/values, and oversized values fail before mutation.
+
+This event reducer deliberately remains transport/provider neutral. Redis credentials, reconnect behavior, pub/sub transport, and snapshot acquisition continue to belong to `.ores-lru.toml` and `ores-redis-lru-cache`.
 
 ## Contract authority
 
 `contracts/main.tsp` and `contracts/authored.schema.json` are independently maintained peer authorities. CI runs `@oresoftware/typespec-json-schema-validator` (`tjsv`) fail-closed over both authorities and the instance corpus. Generated schemas remain evidence only; they are not a third authority.
+
+The Rust implementation is executable admission for those contracts, not a replacement for either authored authority.
 
 ## Safety properties
 
@@ -43,4 +62,8 @@ Listener settings are immutable process configuration. Runtime updates are a sep
 - loopback-only sidecars cannot bind a non-loopback address;
 - runtime config paths cannot be absolute or escape the repository root;
 - runtime keys must be explicit uppercase environment-style names and may not look secret-bearing;
-- runtime snapshots are applied atomically and older/equal revisions cannot regress current state.
+- full runtime snapshots are applied atomically and older/equal revisions cannot regress simple snapshot state;
+- ordered runtime events are shape-checked and applied atomically;
+- revision gaps and explicit resync events fail closed into sticky reconciliation state;
+- authoritative snapshots can repair event-aware state without inventing a new provider revision; and
+- runtime diagnostics do not need to include rejected runtime values.

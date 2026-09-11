@@ -6,7 +6,10 @@
 //! allowlist of values that may be overlaid at runtime. It deliberately does not
 //! own Redis credentials or Redis transport settings: those stay in `.ores-lru.toml`.
 //! `ores-redis-lru-cache` can translate its authoritative `runtime-env` snapshots
-//! into [`RuntimeSnapshotUpdate`] values and apply them through [`RuntimeState`].
+//! into [`RuntimeSnapshotUpdate`] values and ordered provider events into
+//! [`RuntimeEventUpdate`] values. Consumers that need gap detection and resync fencing
+//! use [`RuntimeEventState`]; simple full-snapshot consumers may continue using
+//! [`RuntimeState`].
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,6 +23,7 @@ use thiserror::Error;
 pub const CONFIG_FILE_NAME: &str = ".ores-sidecar.toml";
 pub const CONFIG_PROTOCOL: &str = "ores.sidecar-config.v1";
 pub const RUNTIME_UPDATE_PROTOCOL: &str = "ores.sidecar-runtime.v1";
+pub const RUNTIME_EVENT_PROTOCOL: &str = "ores.sidecar-runtime-event.v1";
 pub const RUNTIME_CACHE_NAME: &str = "runtime-env";
 pub const MAX_CONFIG_FILE_BYTES: usize = 256 * 1024;
 pub const MAX_SIDECARS: usize = 64;
@@ -117,6 +121,34 @@ pub struct RuntimeSnapshotUpdate {
     pub values: Vec<RuntimeValue>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeEventOperation {
+    Upsert,
+    Delete,
+    Replace,
+    Invalidate,
+    Resync,
+}
+
+/// Ordered provider event after the transport adapter has authenticated and decoded it.
+///
+/// Shape is validated again by [`RuntimeEventState::apply_event`]: upserts carry values,
+/// deletes carry keys, replaces carry only values, and invalidate/resync carry neither.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RuntimeEventUpdate {
+    pub protocol: String,
+    pub sidecar: String,
+    /// Canonical positive decimal for event revisions.
+    pub revision: String,
+    pub operation: RuntimeEventOperation,
+    #[serde(default)]
+    pub values: Vec<RuntimeValue>,
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeSnapshot {
     pub revision: u64,
@@ -129,11 +161,31 @@ pub enum RuntimeApplyOutcome {
     StaleIgnored { current: u64, incoming: u64 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeEventOutcome {
+    Applied { previous: u64, current: u64 },
+    Duplicate { current: u64, incoming: u64 },
+    ReconcileRequired { current: u64, incoming: u64 },
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeState {
     sidecar: String,
     allowed_keys: BTreeSet<String>,
     snapshot: RuntimeSnapshot,
+}
+
+/// Event-aware runtime overlay state.
+///
+/// A revision gap or explicit `resync` event makes the state sticky-stale. While stale,
+/// incremental events never mutate state even if the missing revision later arrives. An
+/// authoritative full snapshot passed to [`Self::apply_snapshot`] is required to repair it.
+#[derive(Clone, Debug)]
+pub struct RuntimeEventState {
+    sidecar: String,
+    allowed_keys: BTreeSet<String>,
+    snapshot: RuntimeSnapshot,
+    stale: bool,
 }
 
 impl SidecarConfig {
@@ -291,25 +343,7 @@ impl RuntimeState {
                 incoming: revision,
             });
         }
-        if update.values.len() > MAX_RUNTIME_KEYS {
-            return Err(Error::InvalidRuntimeUpdate(
-                "runtime snapshot contains too many values",
-            ));
-        }
-
-        let mut next = BTreeMap::new();
-        for entry in update.values {
-            validate_runtime_key(&entry.key)?;
-            if !self.allowed_keys.contains(&entry.key) {
-                return Err(Error::RuntimeKeyNotAllowed(entry.key));
-            }
-            if entry.value.len() > MAX_RUNTIME_VALUE_BYTES {
-                return Err(Error::InvalidRuntimeUpdate("runtime value exceeds 64 KiB"));
-            }
-            if next.insert(entry.key.clone(), entry.value).is_some() {
-                return Err(Error::DuplicateRuntimeValue(entry.key));
-            }
-        }
+        let next = validated_runtime_values(&self.allowed_keys, update.values)?;
 
         let previous = self.snapshot.revision;
         self.snapshot = RuntimeSnapshot {
@@ -317,6 +351,155 @@ impl RuntimeState {
             values: next,
         };
         Ok(RuntimeApplyOutcome::Applied {
+            previous,
+            current: revision,
+        })
+    }
+}
+
+impl RuntimeEventState {
+    pub fn new(plan: &RuntimeUpdatePlan) -> Self {
+        Self {
+            sidecar: plan.sidecar.clone(),
+            allowed_keys: plan.allowed_keys.clone(),
+            snapshot: RuntimeSnapshot {
+                revision: 0,
+                values: BTreeMap::new(),
+            },
+            stale: false,
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> &RuntimeSnapshot {
+        &self.snapshot
+    }
+
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Apply an authoritative full snapshot and clear sticky stale state.
+    ///
+    /// Equal revisions are accepted deliberately: a backend reconciliation may need to
+    /// repair locally divergent values without inventing a new provider revision.
+    pub fn apply_snapshot(
+        &mut self,
+        update: RuntimeSnapshotUpdate,
+    ) -> Result<RuntimeApplyOutcome> {
+        if update.protocol != RUNTIME_UPDATE_PROTOCOL {
+            return Err(Error::InvalidRuntimeUpdate("unsupported runtime protocol"));
+        }
+        if update.sidecar != self.sidecar {
+            return Err(Error::RuntimeTargetMismatch {
+                expected: self.sidecar.clone(),
+                actual: update.sidecar,
+            });
+        }
+        let revision = parse_revision(&update.revision)?;
+        if revision < self.snapshot.revision {
+            return Ok(RuntimeApplyOutcome::StaleIgnored {
+                current: self.snapshot.revision,
+                incoming: revision,
+            });
+        }
+        let next = validated_runtime_values(&self.allowed_keys, update.values)?;
+        let previous = self.snapshot.revision;
+        self.snapshot = RuntimeSnapshot {
+            revision,
+            values: next,
+        };
+        self.stale = false;
+        Ok(RuntimeApplyOutcome::Applied {
+            previous,
+            current: revision,
+        })
+    }
+
+    /// Apply one ordered provider event atomically.
+    ///
+    /// Malformed events are rejected without changing revision or stale state. A valid
+    /// revision gap or explicit resync marks the state stale before returning
+    /// `ReconcileRequired`; only an authoritative snapshot can clear that fence.
+    pub fn apply_event(&mut self, update: RuntimeEventUpdate) -> Result<RuntimeEventOutcome> {
+        if update.protocol != RUNTIME_EVENT_PROTOCOL {
+            return Err(Error::InvalidRuntimeEvent("unsupported runtime event protocol"));
+        }
+        if update.sidecar != self.sidecar {
+            return Err(Error::RuntimeTargetMismatch {
+                expected: self.sidecar.clone(),
+                actual: update.sidecar,
+            });
+        }
+        let revision = parse_positive_revision(&update.revision)?;
+        validate_event_shape(&update)?;
+
+        let validated_values = match update.operation {
+            RuntimeEventOperation::Upsert | RuntimeEventOperation::Replace => {
+                Some(validated_runtime_values(&self.allowed_keys, update.values.clone())?)
+            }
+            RuntimeEventOperation::Delete
+            | RuntimeEventOperation::Invalidate
+            | RuntimeEventOperation::Resync => None,
+        };
+        let validated_keys = if update.operation == RuntimeEventOperation::Delete {
+            Some(validated_runtime_keys(&self.allowed_keys, &update.keys)?)
+        } else {
+            None
+        };
+
+        if revision <= self.snapshot.revision {
+            return Ok(RuntimeEventOutcome::Duplicate {
+                current: self.snapshot.revision,
+                incoming: revision,
+            });
+        }
+        if self.stale {
+            return Ok(RuntimeEventOutcome::ReconcileRequired {
+                current: self.snapshot.revision,
+                incoming: revision,
+            });
+        }
+        if revision != self.snapshot.revision.saturating_add(1) {
+            self.stale = true;
+            return Ok(RuntimeEventOutcome::ReconcileRequired {
+                current: self.snapshot.revision,
+                incoming: revision,
+            });
+        }
+        if update.operation == RuntimeEventOperation::Resync {
+            self.stale = true;
+            return Ok(RuntimeEventOutcome::ReconcileRequired {
+                current: self.snapshot.revision,
+                incoming: revision,
+            });
+        }
+
+        let previous = self.snapshot.revision;
+        let mut next = self.snapshot.values.clone();
+        match update.operation {
+            RuntimeEventOperation::Upsert => {
+                for (key, value) in validated_values.expect("upsert values validated") {
+                    next.insert(key, value);
+                }
+            }
+            RuntimeEventOperation::Delete => {
+                for key in validated_keys.expect("delete keys validated") {
+                    next.remove(&key);
+                }
+            }
+            RuntimeEventOperation::Replace => {
+                next = validated_values.expect("replacement values validated");
+            }
+            RuntimeEventOperation::Invalidate => next.clear(),
+            RuntimeEventOperation::Resync => unreachable!("resync returns before mutation"),
+        }
+        self.snapshot = RuntimeSnapshot {
+            revision,
+            values: next,
+        };
+        Ok(RuntimeEventOutcome::Applied {
             previous,
             current: revision,
         })
@@ -386,6 +569,71 @@ fn validate_runtime_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+fn validated_runtime_values(
+    allowed_keys: &BTreeSet<String>,
+    values: Vec<RuntimeValue>,
+) -> Result<BTreeMap<String, String>> {
+    if values.len() > MAX_RUNTIME_KEYS {
+        return Err(Error::InvalidRuntimeUpdate(
+            "runtime update contains too many values",
+        ));
+    }
+    let mut next = BTreeMap::new();
+    for entry in values {
+        validate_runtime_key(&entry.key)?;
+        if !allowed_keys.contains(&entry.key) {
+            return Err(Error::RuntimeKeyNotAllowed(entry.key));
+        }
+        if entry.value.len() > MAX_RUNTIME_VALUE_BYTES {
+            return Err(Error::InvalidRuntimeUpdate("runtime value exceeds 64 KiB"));
+        }
+        if next.insert(entry.key.clone(), entry.value).is_some() {
+            return Err(Error::DuplicateRuntimeValue(entry.key));
+        }
+    }
+    Ok(next)
+}
+
+fn validated_runtime_keys(
+    allowed_keys: &BTreeSet<String>,
+    keys: &[String],
+) -> Result<Vec<String>> {
+    if keys.len() > MAX_RUNTIME_KEYS {
+        return Err(Error::InvalidRuntimeEvent(
+            "runtime delete contains too many keys",
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    for key in keys {
+        validate_runtime_key(key)?;
+        if !allowed_keys.contains(key) {
+            return Err(Error::RuntimeKeyNotAllowed(key.clone()));
+        }
+        if !unique.insert(key.clone()) {
+            return Err(Error::DuplicateRuntimeValue(key.clone()));
+        }
+    }
+    Ok(keys.to_vec())
+}
+
+fn validate_event_shape(update: &RuntimeEventUpdate) -> Result<()> {
+    let valid = match update.operation {
+        RuntimeEventOperation::Upsert => !update.values.is_empty() && update.keys.is_empty(),
+        RuntimeEventOperation::Delete => update.values.is_empty() && !update.keys.is_empty(),
+        RuntimeEventOperation::Replace => update.keys.is_empty(),
+        RuntimeEventOperation::Invalidate | RuntimeEventOperation::Resync => {
+            update.values.is_empty() && update.keys.is_empty()
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidRuntimeEvent(
+            "runtime event operation payload is invalid",
+        ))
+    }
+}
+
 fn is_env_key(value: &str) -> bool {
     let mut bytes = value.bytes();
     let Some(first) = bytes.next() else {
@@ -417,6 +665,16 @@ fn parse_revision(value: &str) -> Result<u64> {
     Ok(revision)
 }
 
+fn parse_positive_revision(value: &str) -> Result<u64> {
+    let revision = parse_revision(value)?;
+    if revision == 0 {
+        return Err(Error::InvalidRuntimeEvent(
+            "event revision must be greater than zero",
+        ));
+    }
+    Ok(revision)
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("sidecar config is invalid: {0}")]
@@ -443,6 +701,8 @@ pub enum Error {
     DuplicateRuntimeKey { sidecar: String, key: String },
     #[error("runtime snapshot is invalid: {0}")]
     InvalidRuntimeUpdate(&'static str),
+    #[error("runtime event is invalid: {0}")]
+    InvalidRuntimeEvent(&'static str),
     #[error("runtime update targeted {actual}, expected {expected}")]
     RuntimeTargetMismatch { expected: String, actual: String },
     #[error("runtime key is not allowlisted by .ores-sidecar.toml: {0}")]
@@ -470,6 +730,37 @@ cache = "runtime-env"
 {sidecars}
 "#
         )
+    }
+
+    fn event_plan() -> RuntimeUpdatePlan {
+        RuntimeUpdatePlan {
+            sidecar: "chat".to_owned(),
+            runtime_namespace: "ores-chat".to_owned(),
+            provider: RuntimeUpdateProvider::OresRedisLruCache,
+            lru_config_path: PathBuf::from(".ores-lru.toml"),
+            role: RuntimeUpdateRole::Server,
+            cache: RUNTIME_CACHE_NAME.to_owned(),
+            allowed_keys: BTreeSet::from([
+                "PROVIDER_TIMEOUT_MS".to_owned(),
+                "WORKER_BATCH_SIZE".to_owned(),
+            ]),
+        }
+    }
+
+    fn event(
+        revision: u64,
+        operation: RuntimeEventOperation,
+        values: Vec<RuntimeValue>,
+        keys: Vec<String>,
+    ) -> RuntimeEventUpdate {
+        RuntimeEventUpdate {
+            protocol: RUNTIME_EVENT_PROTOCOL.to_owned(),
+            sidecar: "chat".to_owned(),
+            revision: revision.to_string(),
+            operation,
+            values,
+            keys,
+        }
     }
 
     #[test]
@@ -664,6 +955,262 @@ runtimeKeys = ["PROVIDER_TIMEOUT_MS"]"#,
     }
 
     #[test]
+    fn ordered_events_apply_and_revision_gap_is_sticky_until_snapshot_repair() {
+        let mut state = RuntimeEventState::new(&event_plan());
+        state
+            .apply_snapshot(RuntimeSnapshotUpdate {
+                protocol: RUNTIME_UPDATE_PROTOCOL.to_owned(),
+                sidecar: "chat".to_owned(),
+                revision: "1".to_owned(),
+                values: Vec::new(),
+            })
+            .unwrap();
+
+        let applied = state
+            .apply_event(event(
+                2,
+                RuntimeEventOperation::Upsert,
+                vec![RuntimeValue {
+                    key: "PROVIDER_TIMEOUT_MS".to_owned(),
+                    value: "2500".to_owned(),
+                }],
+                Vec::new(),
+            ))
+            .unwrap();
+        assert_eq!(
+            applied,
+            RuntimeEventOutcome::Applied {
+                previous: 1,
+                current: 2
+            }
+        );
+
+        let gap = state
+            .apply_event(event(
+                4,
+                RuntimeEventOperation::Upsert,
+                vec![RuntimeValue {
+                    key: "WORKER_BATCH_SIZE".to_owned(),
+                    value: "20".to_owned(),
+                }],
+                Vec::new(),
+            ))
+            .unwrap();
+        assert_eq!(
+            gap,
+            RuntimeEventOutcome::ReconcileRequired {
+                current: 2,
+                incoming: 4
+            }
+        );
+        assert!(state.is_stale());
+        assert!(!state.snapshot().values.contains_key("WORKER_BATCH_SIZE"));
+
+        let would_fill_gap = state
+            .apply_event(event(
+                3,
+                RuntimeEventOperation::Upsert,
+                vec![RuntimeValue {
+                    key: "WORKER_BATCH_SIZE".to_owned(),
+                    value: "15".to_owned(),
+                }],
+                Vec::new(),
+            ))
+            .unwrap();
+        assert_eq!(
+            would_fill_gap,
+            RuntimeEventOutcome::ReconcileRequired {
+                current: 2,
+                incoming: 3
+            }
+        );
+        assert!(!state.snapshot().values.contains_key("WORKER_BATCH_SIZE"));
+
+        let repaired = state
+            .apply_snapshot(RuntimeSnapshotUpdate {
+                protocol: RUNTIME_UPDATE_PROTOCOL.to_owned(),
+                sidecar: "chat".to_owned(),
+                revision: "4".to_owned(),
+                values: vec![RuntimeValue {
+                    key: "WORKER_BATCH_SIZE".to_owned(),
+                    value: "20".to_owned(),
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            repaired,
+            RuntimeApplyOutcome::Applied {
+                previous: 2,
+                current: 4
+            }
+        );
+        assert!(!state.is_stale());
+        assert_eq!(
+            state
+                .snapshot()
+                .values
+                .get("WORKER_BATCH_SIZE")
+                .map(String::as_str),
+            Some("20")
+        );
+    }
+
+    #[test]
+    fn event_operations_are_atomic_and_fail_closed() {
+        let mut state = RuntimeEventState::new(&event_plan());
+        state
+            .apply_snapshot(RuntimeSnapshotUpdate {
+                protocol: RUNTIME_UPDATE_PROTOCOL.to_owned(),
+                sidecar: "chat".to_owned(),
+                revision: "1".to_owned(),
+                values: vec![RuntimeValue {
+                    key: "PROVIDER_TIMEOUT_MS".to_owned(),
+                    value: "2500".to_owned(),
+                }],
+            })
+            .unwrap();
+
+        let invalid = state.apply_event(event(
+            2,
+            RuntimeEventOperation::Upsert,
+            vec![
+                RuntimeValue {
+                    key: "WORKER_BATCH_SIZE".to_owned(),
+                    value: "10".to_owned(),
+                },
+                RuntimeValue {
+                    key: "UNDECLARED_FLAG".to_owned(),
+                    value: "true".to_owned(),
+                },
+            ],
+            Vec::new(),
+        ));
+        assert!(matches!(
+            invalid,
+            Err(Error::RuntimeKeyNotAllowed(key)) if key == "UNDECLARED_FLAG"
+        ));
+        assert_eq!(state.snapshot().revision, 1);
+        assert!(!state.snapshot().values.contains_key("WORKER_BATCH_SIZE"));
+        assert!(!state.is_stale());
+
+        let malformed = state.apply_event(event(
+            2,
+            RuntimeEventOperation::Delete,
+            vec![RuntimeValue {
+                key: "PROVIDER_TIMEOUT_MS".to_owned(),
+                value: "ignored".to_owned(),
+            }],
+            vec!["PROVIDER_TIMEOUT_MS".to_owned()],
+        ));
+        assert!(matches!(malformed, Err(Error::InvalidRuntimeEvent(_))));
+        assert_eq!(state.snapshot().revision, 1);
+        assert!(!state.is_stale());
+    }
+
+    #[test]
+    fn delete_replace_invalidate_and_resync_have_distinct_semantics() {
+        let mut state = RuntimeEventState::new(&event_plan());
+        state
+            .apply_snapshot(RuntimeSnapshotUpdate {
+                protocol: RUNTIME_UPDATE_PROTOCOL.to_owned(),
+                sidecar: "chat".to_owned(),
+                revision: "1".to_owned(),
+                values: vec![
+                    RuntimeValue {
+                        key: "PROVIDER_TIMEOUT_MS".to_owned(),
+                        value: "2500".to_owned(),
+                    },
+                    RuntimeValue {
+                        key: "WORKER_BATCH_SIZE".to_owned(),
+                        value: "10".to_owned(),
+                    },
+                ],
+            })
+            .unwrap();
+
+        state
+            .apply_event(event(
+                2,
+                RuntimeEventOperation::Delete,
+                Vec::new(),
+                vec!["PROVIDER_TIMEOUT_MS".to_owned()],
+            ))
+            .unwrap();
+        assert!(!state.snapshot().values.contains_key("PROVIDER_TIMEOUT_MS"));
+
+        state
+            .apply_event(event(
+                3,
+                RuntimeEventOperation::Replace,
+                vec![RuntimeValue {
+                    key: "PROVIDER_TIMEOUT_MS".to_owned(),
+                    value: "3000".to_owned(),
+                }],
+                Vec::new(),
+            ))
+            .unwrap();
+        assert_eq!(state.snapshot().values.len(), 1);
+        assert!(!state.snapshot().values.contains_key("WORKER_BATCH_SIZE"));
+
+        state
+            .apply_event(event(
+                4,
+                RuntimeEventOperation::Invalidate,
+                Vec::new(),
+                Vec::new(),
+            ))
+            .unwrap();
+        assert!(state.snapshot().values.is_empty());
+
+        let resync = state
+            .apply_event(event(
+                5,
+                RuntimeEventOperation::Resync,
+                Vec::new(),
+                Vec::new(),
+            ))
+            .unwrap();
+        assert_eq!(
+            resync,
+            RuntimeEventOutcome::ReconcileRequired {
+                current: 4,
+                incoming: 5
+            }
+        );
+        assert!(state.is_stale());
+        assert_eq!(state.snapshot().revision, 4);
+    }
+
+    #[test]
+    fn duplicate_events_are_idempotent_and_do_not_reopen_stale_state() {
+        let mut state = RuntimeEventState::new(&event_plan());
+        state
+            .apply_snapshot(RuntimeSnapshotUpdate {
+                protocol: RUNTIME_UPDATE_PROTOCOL.to_owned(),
+                sidecar: "chat".to_owned(),
+                revision: "2".to_owned(),
+                values: Vec::new(),
+            })
+            .unwrap();
+        let duplicate = state
+            .apply_event(event(
+                2,
+                RuntimeEventOperation::Invalidate,
+                Vec::new(),
+                Vec::new(),
+            ))
+            .unwrap();
+        assert_eq!(
+            duplicate,
+            RuntimeEventOutcome::Duplicate {
+                current: 2,
+                incoming: 2
+            }
+        );
+        assert!(!state.is_stale());
+    }
+
+    #[test]
     fn runtime_update_json_uses_precision_safe_revision_strings() {
         let update = RuntimeSnapshotUpdate {
             protocol: RUNTIME_UPDATE_PROTOCOL.to_owned(),
@@ -673,5 +1220,16 @@ runtimeKeys = ["PROVIDER_TIMEOUT_MS"]"#,
         };
         let json = serde_json::to_value(update).unwrap();
         assert_eq!(json["revision"], MAX_SAFE_REVISION.to_string());
+
+        let event = RuntimeEventUpdate {
+            protocol: RUNTIME_EVENT_PROTOCOL.to_owned(),
+            sidecar: "chat".to_owned(),
+            revision: MAX_SAFE_REVISION.to_string(),
+            operation: RuntimeEventOperation::Invalidate,
+            values: Vec::new(),
+            keys: Vec::new(),
+        };
+        let event_json = serde_json::to_value(event).unwrap();
+        assert_eq!(event_json["revision"], MAX_SAFE_REVISION.to_string());
     }
 }
