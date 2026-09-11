@@ -375,9 +375,7 @@ impl RuntimeState {
                     return Err(Error::RuntimeKeyNotAllowed(entry.key));
                 }
                 if entry.value.len() > MAX_RUNTIME_VALUE_BYTES {
-                    return Err(Error::InvalidRuntimeUpdate(
-                        "runtime value exceeds 64 KiB",
-                    ));
+                    return Err(Error::InvalidRuntimeUpdate("runtime value exceeds 64 KiB"));
                 }
                 if next.insert(entry.key.clone(), entry.value).is_some() {
                     return Err(Error::DuplicateRuntimeValue(entry.key));
@@ -731,7 +729,10 @@ runtimeKeys = ["API_TOKEN"]"#,
 
     #[test]
     fn stale_functional_transition_returns_fresh_value_and_preserves_source() {
-        let seeded = runtime_state().transition(runtime_update(7, Some("2500"))).unwrap().next;
+        let seeded = runtime_state()
+            .transition(runtime_update(7, Some("2500")))
+            .unwrap()
+            .next;
         let transition = seeded.transition(runtime_update(6, None)).unwrap();
 
         assert_eq!(
