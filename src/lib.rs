@@ -129,11 +129,27 @@ pub enum RuntimeApplyOutcome {
     StaleIgnored { current: u64, incoming: u64 },
 }
 
-#[derive(Clone, Debug)]
+/// Result of applying one runtime update without mutating the source state.
+///
+/// `next` owns independent strings, collections, and snapshot values. It can be
+/// retained, mutated through the compatibility shell, or moved to another task
+/// without aliasing the `RuntimeState` used to create it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeTransition {
+    pub next: RuntimeState,
+    pub outcome: RuntimeApplyOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeState {
     sidecar: String,
     allowed_keys: BTreeSet<String>,
     snapshot: RuntimeSnapshot,
+}
+
+struct RuntimeStateChange {
+    next_snapshot: Option<RuntimeSnapshot>,
+    outcome: RuntimeApplyOutcome,
 }
 
 impl SidecarConfig {
@@ -259,7 +275,7 @@ impl RuntimeState {
     pub fn new(plan: &RuntimeUpdatePlan) -> Self {
         Self {
             sidecar: plan.sidecar.clone(),
-            allowed_keys: plan.allowed_keys.clone(),
+            allowed_keys: plan.allowed_keys.iter().cloned().collect(),
             snapshot: RuntimeSnapshot {
                 revision: 0,
                 values: BTreeMap::new(),
@@ -271,10 +287,61 @@ impl RuntimeState {
         &self.snapshot
     }
 
-    /// Apply a complete runtime snapshot. `ores-redis-lru-cache` should reconcile
-    /// event gaps before calling this API, then pass the authoritative `runtime-env`
-    /// snapshot and its revision. Older/equal revisions cannot regress local state.
+    /// Return a fully independent state value.
+    fn independent(&self) -> Self {
+        Self {
+            sidecar: self.sidecar.clone(),
+            allowed_keys: self.allowed_keys.iter().cloned().collect(),
+            snapshot: RuntimeSnapshot {
+                revision: self.snapshot.revision,
+                values: self
+                    .snapshot
+                    .values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            },
+        }
+    }
+
+    /// Compute the next runtime state without mutating `self`.
+    ///
+    /// This is the preferred domain/state-machine API. Every successful return
+    /// owns a fully independent `RuntimeState`; even a stale update produces a
+    /// fresh value so callers can reason in `next = transition(current)` terms.
+    pub fn transition(&self, update: RuntimeSnapshotUpdate) -> Result<RuntimeTransition> {
+        let change = self.plan_update(update)?;
+        let next = match change.next_snapshot {
+            Some(snapshot) => Self {
+                sidecar: self.sidecar.clone(),
+                allowed_keys: self.allowed_keys.iter().cloned().collect(),
+                snapshot,
+            },
+            None => self.independent(),
+        };
+        Ok(RuntimeTransition {
+            next,
+            outcome: change.outcome,
+        })
+    }
+
+    /// Apply a complete runtime snapshot to this long-lived runtime holder.
+    ///
+    /// This compatibility shell is intentionally imperative. Runtime updates may
+    /// arrive repeatedly, while sidecar identity and the allowlist are immutable;
+    /// rebuilding those metadata allocations for every update would add copy work
+    /// with no semantic benefit. The mutation is therefore limited to swapping in
+    /// the whole freshly constructed snapshot produced by the pure transition
+    /// planner. Use [`Self::transition`] when alias-free value flow is preferred.
     pub fn apply(&mut self, update: RuntimeSnapshotUpdate) -> Result<RuntimeApplyOutcome> {
+        let change = self.plan_update(update)?;
+        if let Some(snapshot) = change.next_snapshot {
+            self.snapshot = snapshot;
+        }
+        Ok(change.outcome)
+    }
+
+    fn plan_update(&self, update: RuntimeSnapshotUpdate) -> Result<RuntimeStateChange> {
         if update.protocol != RUNTIME_UPDATE_PROTOCOL {
             return Err(Error::InvalidRuntimeUpdate("unsupported runtime protocol"));
         }
@@ -286,9 +353,12 @@ impl RuntimeState {
         }
         let revision = parse_revision(&update.revision)?;
         if revision <= self.snapshot.revision {
-            return Ok(RuntimeApplyOutcome::StaleIgnored {
-                current: self.snapshot.revision,
-                incoming: revision,
+            return Ok(RuntimeStateChange {
+                next_snapshot: None,
+                outcome: RuntimeApplyOutcome::StaleIgnored {
+                    current: self.snapshot.revision,
+                    incoming: revision,
+                },
             });
         }
         if update.values.len() > MAX_RUNTIME_KEYS {
@@ -297,28 +367,29 @@ impl RuntimeState {
             ));
         }
 
-        let mut next = BTreeMap::new();
-        for entry in update.values {
-            validate_runtime_key(&entry.key)?;
-            if !self.allowed_keys.contains(&entry.key) {
-                return Err(Error::RuntimeKeyNotAllowed(entry.key));
-            }
-            if entry.value.len() > MAX_RUNTIME_VALUE_BYTES {
-                return Err(Error::InvalidRuntimeUpdate("runtime value exceeds 64 KiB"));
-            }
-            if next.insert(entry.key.clone(), entry.value).is_some() {
-                return Err(Error::DuplicateRuntimeValue(entry.key));
-            }
-        }
+        let values = update.values.into_iter().try_fold(
+            BTreeMap::new(),
+            |mut next, entry| -> Result<BTreeMap<String, String>> {
+                validate_runtime_key(&entry.key)?;
+                if !self.allowed_keys.contains(&entry.key) {
+                    return Err(Error::RuntimeKeyNotAllowed(entry.key));
+                }
+                if entry.value.len() > MAX_RUNTIME_VALUE_BYTES {
+                    return Err(Error::InvalidRuntimeUpdate("runtime value exceeds 64 KiB"));
+                }
+                if next.insert(entry.key.clone(), entry.value).is_some() {
+                    return Err(Error::DuplicateRuntimeValue(entry.key));
+                }
+                Ok(next)
+            },
+        )?;
 
-        let previous = self.snapshot.revision;
-        self.snapshot = RuntimeSnapshot {
-            revision,
-            values: next,
-        };
-        Ok(RuntimeApplyOutcome::Applied {
-            previous,
-            current: revision,
+        Ok(RuntimeStateChange {
+            next_snapshot: Some(RuntimeSnapshot { revision, values }),
+            outcome: RuntimeApplyOutcome::Applied {
+                previous: self.snapshot.revision,
+                current: revision,
+            },
         })
     }
 }
@@ -472,6 +543,37 @@ cache = "runtime-env"
         )
     }
 
+    fn runtime_state() -> RuntimeState {
+        let parsed = SidecarConfig::parse(&config(
+            r#"[[sidecars]]
+name = "chat"
+enabled = true
+bindIp = "127.0.0.1"
+bindPort = 7410
+loopbackOnly = true
+runtimeNamespace = "ores-chat"
+runtimeKeys = ["PROVIDER_TIMEOUT_MS"]"#,
+        ))
+        .unwrap();
+        let sidecar = parsed.resolve_one(None).unwrap();
+        RuntimeState::new(&parsed.runtime_plan_for(&sidecar).unwrap())
+    }
+
+    fn runtime_update(revision: u64, value: Option<&str>) -> RuntimeSnapshotUpdate {
+        RuntimeSnapshotUpdate {
+            protocol: RUNTIME_UPDATE_PROTOCOL.to_owned(),
+            sidecar: "chat".to_owned(),
+            revision: revision.to_string(),
+            values: value
+                .into_iter()
+                .map(|value| RuntimeValue {
+                    key: "PROVIDER_TIMEOUT_MS".to_owned(),
+                    value: value.to_owned(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn one_sidecar_is_the_implicit_default() {
         let parsed = SidecarConfig::parse(&config(
@@ -572,32 +674,9 @@ runtimeKeys = ["API_TOKEN"]"#,
 
     #[test]
     fn runtime_snapshots_are_allowlisted_and_monotonic() {
-        let parsed = SidecarConfig::parse(&config(
-            r#"[[sidecars]]
-name = "chat"
-enabled = true
-bindIp = "127.0.0.1"
-bindPort = 7410
-loopbackOnly = true
-runtimeNamespace = "chat"
-runtimeKeys = ["PROVIDER_TIMEOUT_MS"]"#,
-        ))
-        .unwrap();
-        let sidecar = parsed.resolve_one(None).unwrap();
-        let plan = parsed.runtime_plan_for(&sidecar).unwrap();
-        let mut state = RuntimeState::new(&plan);
+        let mut state = runtime_state();
 
-        let applied = state
-            .apply(RuntimeSnapshotUpdate {
-                protocol: RUNTIME_UPDATE_PROTOCOL.to_owned(),
-                sidecar: "chat".to_owned(),
-                revision: "7".to_owned(),
-                values: vec![RuntimeValue {
-                    key: "PROVIDER_TIMEOUT_MS".to_owned(),
-                    value: "2500".to_owned(),
-                }],
-            })
-            .unwrap();
+        let applied = state.apply(runtime_update(7, Some("2500"))).unwrap();
         assert_eq!(
             applied,
             RuntimeApplyOutcome::Applied {
@@ -606,14 +685,7 @@ runtimeKeys = ["PROVIDER_TIMEOUT_MS"]"#,
             }
         );
 
-        let stale = state
-            .apply(RuntimeSnapshotUpdate {
-                protocol: RUNTIME_UPDATE_PROTOCOL.to_owned(),
-                sidecar: "chat".to_owned(),
-                revision: "6".to_owned(),
-                values: Vec::new(),
-            })
-            .unwrap();
+        let stale = state.apply(runtime_update(6, None)).unwrap();
         assert_eq!(
             stale,
             RuntimeApplyOutcome::StaleIgnored {
@@ -632,21 +704,73 @@ runtimeKeys = ["PROVIDER_TIMEOUT_MS"]"#,
     }
 
     #[test]
+    fn functional_transition_returns_independent_state_without_mutating_source() {
+        let source = runtime_state();
+        let transition = source.transition(runtime_update(7, Some("2500"))).unwrap();
+
+        assert_eq!(source.snapshot().revision, 0);
+        assert!(source.snapshot().values.is_empty());
+        assert_eq!(transition.next.snapshot().revision, 7);
+        assert_eq!(
+            transition
+                .next
+                .snapshot()
+                .values
+                .get("PROVIDER_TIMEOUT_MS")
+                .map(String::as_str),
+            Some("2500")
+        );
+
+        let mut evolved = transition.next;
+        evolved.apply(runtime_update(8, Some("3000"))).unwrap();
+        assert_eq!(source.snapshot().revision, 0);
+        assert_eq!(evolved.snapshot().revision, 8);
+    }
+
+    #[test]
+    fn stale_functional_transition_returns_fresh_value_and_preserves_source() {
+        let seeded = runtime_state()
+            .transition(runtime_update(7, Some("2500")))
+            .unwrap()
+            .next;
+        let transition = seeded.transition(runtime_update(6, None)).unwrap();
+
+        assert_eq!(
+            transition.outcome,
+            RuntimeApplyOutcome::StaleIgnored {
+                current: 7,
+                incoming: 6
+            }
+        );
+        assert_eq!(transition.next, seeded);
+
+        let mut evolved = transition.next;
+        evolved.apply(runtime_update(8, Some("3000"))).unwrap();
+        assert_eq!(seeded.snapshot().revision, 7);
+        assert_eq!(
+            seeded
+                .snapshot()
+                .values
+                .get("PROVIDER_TIMEOUT_MS")
+                .map(String::as_str),
+            Some("2500")
+        );
+    }
+
+    #[test]
+    fn imperative_shell_matches_functional_transition() {
+        let source = runtime_state();
+        let expected = source.transition(runtime_update(7, Some("2500"))).unwrap();
+        let mut applied = source;
+        let outcome = applied.apply(runtime_update(7, Some("2500"))).unwrap();
+
+        assert_eq!(outcome, expected.outcome);
+        assert_eq!(applied, expected.next);
+    }
+
+    #[test]
     fn undeclared_runtime_values_are_rejected_without_partial_application() {
-        let parsed = SidecarConfig::parse(&config(
-            r#"[[sidecars]]
-name = "chat"
-enabled = true
-bindIp = "127.0.0.1"
-bindPort = 7410
-loopbackOnly = true
-runtimeNamespace = "chat"
-runtimeKeys = ["PROVIDER_TIMEOUT_MS"]"#,
-        ))
-        .unwrap();
-        let sidecar = parsed.resolve_one(None).unwrap();
-        let plan = parsed.runtime_plan_for(&sidecar).unwrap();
-        let mut state = RuntimeState::new(&plan);
+        let mut state = runtime_state();
         let result = state.apply(RuntimeSnapshotUpdate {
             protocol: RUNTIME_UPDATE_PROTOCOL.to_owned(),
             sidecar: "chat".to_owned(),
