@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "repository": "ORESoftware/ores-sidecar.rs",
+  "status": "compatibility",
+  "canonical_runtime_repository": "ores-otel/ores-otel-sidecar.rs",
+  "canonical_runtime_work_goes_here": false,
+  "config_contract": {
+    "filename": ".ores-sidecar.toml",
+    "protocol": "ores.sidecar-config.v1",
+    "peer_authorities": [
+      "contracts/main.tsp",
+      "contracts/authored.schema.json"
+    ],
+    "ownership_during_migration": "compatibility contract remains here until the canonical runtime consumes the same peer-authority corpus and consumer migration is complete"
+  },
+  "allowed_source_paths": ["src/lib.rs"],
+  "release_policy": {
+    "baseline_version": "0.1.0",
+    "allowed": "patch-only compatibility releases for existing consumers",
+    "forbidden": ["new shared runtime subsystem", "new major version", "new minor feature line"]
+  },
+  "pinning_policy": "Consumers migrating from this remote must use immutable Git revisions or immutable released versions.",
+  "retirement_criteria": [
+    "ores-otel/ores-otel-sidecar.rs consumes the same admitted .ores-sidecar.toml contract corpus",
+    "all active consumers use the canonical runtime repository or an immutable compatibility pin",
+    "no compatibility-only fix is required here for 180 days"
+  ],
+  "policy_version": 1
+}

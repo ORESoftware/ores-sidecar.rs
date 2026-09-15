@@ -1,9 +1,10 @@
-
-Note: canonical lib is in - ores-otel/ores-otel-sidecar.rs - The repo-local control file confirms the same thing even more explicitly: ores-otel/ores-otel-sidecar.rs is the canonical shared library, and product sidecars are supposed to import it rather than copy config/health/runtime.
-
 # ores-sidecar.rs
 
+> **Compatibility surface, not the canonical shared runtime.** The canonical shared sidecar runtime lives in `ores-otel/ores-otel-sidecar.rs`. New shared runtime implementation belongs there. This repository remains responsible for compatibility of the existing `.ores-sidecar.toml` / `ores.sidecar-config.v1` contract while consumers migrate.
+
 Shared Rust configuration and runtime-update contracts for ORESoftware sidecars.
+
+See [`COMPATIBILITY.json`](./COMPATIBILITY.json), [`CONSUMERS.md`](./CONSUMERS.md), and [`MIGRATION.md`](./MIGRATION.md). Consumers of this compatibility remote should use immutable Git revisions or immutable patch releases. CI runs `python3 scripts/validate-compatibility.py` to prevent accidental expansion into a second canonical runtime.
 
 ## `.ores-sidecar.toml`
 
@@ -36,6 +37,8 @@ Listener settings are immutable process configuration. Runtime updates are a sep
 
 `contracts/main.tsp` and `contracts/authored.schema.json` are independently maintained peer authorities. CI runs `@oresoftware/typespec-json-schema-validator` (`tjsv`) fail-closed over both authorities and the instance corpus. Generated schemas remain evidence only; they are not a third authority.
 
+During migration this repository keeps the compatibility contract only until `ores-otel/ores-otel-sidecar.rs` consumes the same admitted peer-authority corpus. That transition must not be implemented by copying and independently editing a second TypeSpec or JSON Schema authority.
+
 ## Safety properties
 
 - config files are capped at 256 KiB and reject unknown fields;
@@ -44,3 +47,7 @@ Listener settings are immutable process configuration. Runtime updates are a sep
 - runtime config paths cannot be absolute or escape the repository root;
 - runtime keys must be explicit uppercase environment-style names and may not look secret-bearing;
 - runtime snapshots are applied atomically and older/equal revisions cannot regress current state.
+
+## Compatibility freeze
+
+The existing `src/lib.rs` surface may receive compatibility/security/conformance fixes. New runtime subsystems or feature modules are rejected by the compatibility validator and belong in the canonical `ores-otel` runtime. The current compatibility crate baseline is `0.1.0`; policy permits patch-only compatibility releases after an explicit reviewed policy update rather than silently opening a new feature line.
