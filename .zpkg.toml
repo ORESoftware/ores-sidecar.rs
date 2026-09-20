@@ -34,6 +34,16 @@ dir = ".vendor/.zed"
 dir = "."
 adapter = "rust"
 
+[targets.contracts]
+dir = "contracts"
+name = "ores-sidecar-contracts"
+adapter = "none"
+
+[targets.conformance]
+dir = "conformance"
+name = "ores-sidecar-conformance"
+adapter = "none"
+
 [scripts]
-test = "cargo test --all-targets"
+test = "sh conformance/check.sh && cargo test --all-targets"
 contracts = "npm install --no-audit --no-fund && mkdir -p artifacts && npm run contract:check"
