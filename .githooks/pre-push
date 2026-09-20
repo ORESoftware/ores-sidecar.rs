@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$root"
+[ -f .zpkg.toml ] || exit 0
+zed_bin="${ZED_BIN:-$(command -v zed 2>/dev/null || true)}"
+if [ -z "$zed_bin" ]; then
+  echo "[zed-pre-push] zed not found on PATH; refusing to bypass package validation" >&2
+  exit 1
+fi
+if [ -f .zpkg.lock ]; then "$zed_bin" validate --require-lock; else "$zed_bin" validate; fi
+sh ./conformance/check.sh --full
