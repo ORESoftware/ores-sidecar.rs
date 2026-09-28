@@ -45,10 +45,7 @@ fn failed_multi_value_update_is_atomic_for_the_imperative_shell() {
 
     let result = state.apply(update(
         "2",
-        &[
-            ("PROVIDER_TIMEOUT_MS", "3000"),
-            ("UNDECLARED_FLAG", "true"),
-        ],
+        &[("PROVIDER_TIMEOUT_MS", "3000"), ("UNDECLARED_FLAG", "true")],
     ));
 
     assert!(matches!(
