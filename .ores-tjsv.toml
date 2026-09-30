@@ -1,0 +1,16 @@
+version = 1
+default_contract = "sidecar"
+
+[authority]
+typespec = "peer-authority"
+json_schema = "peer-authority"
+
+[defaults]
+report = "artifacts/schema-parity.json"
+output_dir = ".typespec-json-schema-validator/generated"
+instances = "contracts/instances"
+
+[[contracts]]
+id = "sidecar"
+typespec = "contracts/main.tsp"
+schema = "contracts/authored.schema.json"

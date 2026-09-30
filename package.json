@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "contract:check": "tjsv check --typespec=./contracts/main.tsp --schema=./contracts/authored.schema.json --instances=./contracts/instances --report=./artifacts/schema-parity.json --quiet"
+    "contract:check": "tjsv check --quiet"
   },
   "devDependencies": {
-    "@oresoftware/typespec-json-schema-validator": "https://github.com/ORESoftware/typespec-json-schema-validator/archive/7241f8e52dcc4518c72f0fdb5152d6cf66c86656.tar.gz"
+    "@oresoftware/typespec-json-schema-validator": "https://github.com/ORESoftware/typespec-json-schema-validator/archive/246440fc876938376b036f8b7759e8dd2bed5794.tar.gz"
   },
   "engines": {
     "node": ">=22.9"
